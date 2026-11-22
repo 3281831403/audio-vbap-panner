@@ -22,9 +22,47 @@ matrix ``M`` used by VBAP, so the linear system is ``M @ L = d`` and its
 solution is ``L = M**-1 @ d``.
 
 All geometric results are expected to agree with exact real arithmetic to
-``1e-9`` unless a function says otherwise.  This starter module deliberately
-contains no implementation: every function raises ``NotImplementedError``.
+``1e-9`` unless a function says otherwise.
 """
+
+import math
+
+# Tolerance used when deciding whether a coefficient is non-negative, and
+# when testing which side of a plane a speaker lies on.
+_NEG_TOL = 1e-12
+_SIDE_TOL = 1e-9
+
+
+def _dot(left, right) -> float:
+    return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+
+
+def _cross(left, right) -> tuple:
+    return (
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    )
+
+
+def _norm(vector) -> float:
+    return math.sqrt(_dot(vector, vector))
+
+
+def _normalized(vector) -> tuple:
+    length = _norm(vector)
+    if not length > 0.0:
+        raise ValueError("cannot normalize a zero vector")
+    return (vector[0] / length, vector[1] / length, vector[2] / length)
+
+
+def _solve(tri, direction) -> list[float]:
+    """Solve ``M @ L = direction`` for the columns-given matrix ``M``."""
+    inverse = inverse_matrix(tri)
+    return [
+        sum(inverse[row][column] * direction[column] for column in range(3))
+        for row in range(3)
+    ]
 
 
 def speaker_vectors(layout) -> list[tuple]:
@@ -40,7 +78,52 @@ def speaker_vectors(layout) -> list[tuple]:
     The returned list has the same length and order as ``layout`` and every
     vector has unit length within ``1e-12``.
     """
-    raise NotImplementedError
+    vectors = []
+    for azimuth_deg, elevation_deg in layout:
+        azimuth = math.radians(azimuth_deg)
+        elevation = math.radians(elevation_deg)
+        cos_elevation = math.cos(elevation)
+        vectors.append(
+            (
+                cos_elevation * math.sin(azimuth),
+                cos_elevation * math.cos(azimuth),
+                math.sin(elevation),
+            )
+        )
+    return vectors
+
+
+def _is_facet(vectors, first, second, third, candidate_indices) -> bool:
+    """Return whether the three speakers form a facet of the convex hull."""
+    p0 = vectors[first]
+    p1 = vectors[second]
+    p2 = vectors[third]
+    normal = _cross(
+        (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]),
+        (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]),
+    )
+    length = _norm(normal)
+    if not length > 0.0:
+        # Degenerate (collinear) triple, never a facet.
+        return False
+    # Scale the side tolerance with the plane normal so the test is relative.
+    tolerance = _SIDE_TOL * length
+    has_positive = False
+    has_negative = False
+    for index in candidate_indices:
+        vector = vectors[index]
+        side = _dot(
+            normal,
+            (vector[0] - p0[0], vector[1] - p0[1], vector[2] - p0[2]),
+        )
+        if side > tolerance:
+            has_positive = True
+        elif side < -tolerance:
+            has_negative = True
+        if has_positive and has_negative:
+            # Speakers on both sides: this plane cuts through the hull.
+            return False
+    return True
 
 
 def find_triangle(vectors, dir) -> tuple:
@@ -62,7 +145,30 @@ def find_triangle(vectors, dir) -> tuple:
     result is a tuple of three ascending indices.  Do not return a triangle
     that merely has large dot products but does not contain the direction.
     """
-    raise NotImplementedError
+    count = len(vectors)
+    direction = _normalized(dir)
+
+    all_indices = tuple(range(count))
+    for first in range(count):
+        for second in range(first + 1, count):
+            for third in range(second + 1, count):
+                indices = (first, second, third)
+                others = tuple(
+                    index for index in all_indices if index not in indices
+                )
+                if not _is_facet(vectors, first, second, third, others):
+                    continue
+                tri = [vectors[first], vectors[second], vectors[third]]
+                try:
+                    coefficients = _solve(tri, direction)
+                except ValueError:
+                    # Degenerate matrix; cannot contain the direction.
+                    continue
+                if all(
+                    coefficient >= -_NEG_TOL for coefficient in coefficients
+                ):
+                    return indices
+    raise ValueError("direction is not contained in any hull triangle")
 
 
 def inverse_matrix(tri) -> list[list[float]]:
@@ -73,7 +179,38 @@ def inverse_matrix(tri) -> list[list[float]]:
     ``1e-12``, where ``M[:, j] == tri[j]``.  Raise ``ValueError`` for a
     singular matrix.
     """
-    raise NotImplementedError
+    # M has columns tri[0], tri[1], tri[2], so M[row][column] = tri[column][row].
+    a, b, c = tri[0][0], tri[1][0], tri[2][0]
+    d, e, f = tri[0][1], tri[1][1], tri[2][1]
+    g, h, i = tri[0][2], tri[1][2], tri[2][2]
+
+    determinant = (
+        a * (e * i - f * h)
+        - b * (d * i - f * g)
+        + c * (d * h - e * g)
+    )
+    if abs(determinant) < 1e-12:
+        raise ValueError("singular matrix")
+
+    # inv[row][column] = cofactor(M, column, row) / determinant; the inverse
+    # is the transposed cofactor matrix divided by the determinant.
+    return [
+        [
+            (e * i - f * h) / determinant,
+            (c * h - b * i) / determinant,
+            (b * f - c * e) / determinant,
+        ],
+        [
+            (f * g - d * i) / determinant,
+            (a * i - c * g) / determinant,
+            (c * d - a * f) / determinant,
+        ],
+        [
+            (d * h - e * g) / determinant,
+            (b * g - a * h) / determinant,
+            (a * e - b * d) / determinant,
+        ],
+    ]
 
 
 def gains_for(tri, dir) -> list[float]:
@@ -92,7 +229,13 @@ def gains_for(tri, dir) -> list[float]:
     has three non-negative values in triangle order, and the sum of their
     squares is ``1.0`` within ``1e-9``.
     """
-    raise NotImplementedError
+    direction = _normalized(dir)
+    raw = _solve(tri, direction)
+    gains = [gain if gain > 0.0 else 0.0 for gain in raw]
+    energy_value = math.sqrt(sum(gain * gain for gain in gains))
+    if not energy_value > 0.0:
+        raise ValueError("all gains were clamped to zero")
+    return [gain / energy_value for gain in gains]
 
 
 def pan(dir, layout) -> dict:
@@ -107,7 +250,15 @@ def pan(dir, layout) -> dict:
     layout speaker and ``tri`` is the sorted index triple.  The gain vector
     must be deterministic at a triangle boundary and continuous across it.
     """
-    raise NotImplementedError
+    vectors = speaker_vectors(layout)
+    tri = find_triangle(vectors, dir)
+    triangle_vectors = [vectors[index] for index in tri]
+    weights = gains_for(triangle_vectors, dir)
+
+    gains = [0.0] * len(vectors)
+    for index, weight in zip(tri, weights):
+        gains[index] = weight
+    return {"gains": gains, "tri": tri}
 
 
 def energy(gains) -> float:
@@ -116,7 +267,7 @@ def energy(gains) -> float:
     ``energy([]) == 0.0``.  The value is non-negative and, for the output of
     :func:`gains_for` or :func:`pan`, equals ``1.0`` within ``1e-9``.
     """
-    raise NotImplementedError
+    return sum(gain * gain for gain in gains)
 
 
 def transition_weights(dir, tri_a, tri_b) -> list[float]:
@@ -140,7 +291,24 @@ def transition_weights(dir, tri_a, tri_b) -> list[float]:
     weights must then be identical and each three-element block must sum to
     ``1.0`` within ``1e-9``.  Do not use an unnormalized linear angle blend.
     """
-    raise NotImplementedError
+    direction = _normalized(dir)
+
+    def block(tri) -> list[float]:
+        coefficients = _solve(list(tri), direction)
+        if not all(
+            coefficient >= -_NEG_TOL for coefficient in coefficients
+        ):
+            return [0.0, 0.0, 0.0]
+        clamped = [
+            coefficient if coefficient > 0.0 else 0.0
+            for coefficient in coefficients
+        ]
+        total = sum(clamped)
+        if not total > 0.0:
+            return [0.0, 0.0, 0.0]
+        return [value / total for value in clamped]
+
+    return block(tri_a) + block(tri_b)
 
 
 def pan_batch(dirs, layout) -> dict:
@@ -152,4 +320,10 @@ def pan_batch(dirs, layout) -> dict:
     per-speaker gain list for ``dirs[i]`` and ``tris[i]`` is its sorted
     triangle tuple.  The order and length match ``dirs``.
     """
-    raise NotImplementedError
+    gains = []
+    tris = []
+    for direction in dirs:
+        result = pan(direction, layout)
+        gains.append(result["gains"])
+        tris.append(result["tri"])
+    return {"gains": gains, "tris": tris}
